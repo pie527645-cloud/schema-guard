@@ -176,3 +176,103 @@ test('tokenizeCommand & CLI symlink entrypoint: preserves Windows paths and runs
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test('CLI snapshot: preserves multi-byte UTF-8 across split stdout and stderr pipe chunks', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'sg-utf8-'));
+  try {
+    const mockServerPath = path.join(tmpDir, 'split-utf8-mcp.mjs');
+    const snapshotOutPath = path.join(tmpDir, 'utf8-snapshot.json');
+
+    const mockServerCode = `
+import readline from 'node:readline';
+
+const mode = process.argv[2];
+if (mode === 'stderr-fail') {
+  const errBytes = Buffer.from('致命的エラー🚀発生\\n', 'utf8');
+  const rocketIdx = errBytes.indexOf(0xf0);
+  process.stderr.write(errBytes.subarray(0, rocketIdx + 2));
+  setTimeout(() => {
+    process.stderr.write(errBytes.subarray(rocketIdx + 2), () => {
+      process.exit(1);
+    });
+  }, 25);
+} else {
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  rl.on('line', (line) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+    const msg = JSON.parse(trimmed);
+
+    if (msg.method === 'initialize') {
+      process.stdout.write(JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          protocolVersion: '2024-11-05',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'utf8-mcp', version: '0.1.0' }
+        }
+      }) + '\\n');
+      return;
+    }
+
+    if (msg.method === 'tools/list') {
+      const frame = Buffer.from(JSON.stringify({
+        jsonrpc: '2.0',
+        id: msg.id,
+        result: {
+          tools: [
+            {
+              name: 'utf8_contract_tool',
+              description: '契約スナップショット🚀検証',
+              inputSchema: { type: 'object', properties: { note: { type: 'string' } } }
+            }
+          ]
+        }
+      }), 'utf8');
+      const rocketIdx = frame.indexOf(0xf0);
+      process.stdout.write(frame.subarray(0, rocketIdx + 2));
+      setTimeout(() => {
+        process.stdout.write(frame.subarray(rocketIdx + 2), () => {
+          process.exit(0);
+        });
+      }, 25);
+    }
+  });
+  setInterval(() => {}, 10000);
+}
+`;
+    fs.writeFileSync(mockServerPath, mockServerCode, 'utf8');
+
+    const okCmd = `"${process.execPath}" "${mockServerPath}" stdout-ok`;
+    const okExit = await runCli([
+      'snapshot',
+      '--stdio',
+      okCmd,
+      '--out',
+      snapshotOutPath,
+      '--timeout',
+      '10000'
+    ]);
+    assert.equal(okExit, 0);
+    const writtenRaw = fs.readFileSync(snapshotOutPath, 'utf8');
+    assert.equal(writtenRaw.includes('\uFFFD'), false);
+    const parsed = JSON.parse(writtenRaw) as {
+      tools: Array<{ name: string; description?: string }>;
+    };
+    assert.equal(parsed.tools.length, 1);
+    assert.equal(parsed.tools[0]?.description, '契約スナップショット🚀検証');
+
+    const failCmd = `"${process.execPath}" "${mockServerPath}" stderr-fail`;
+    let errMsg = '';
+    const failExit = await runCli(
+      ['snapshot', '--stdio', failCmd, '--out', path.join(tmpDir, 'unused.json'), '--timeout', '5000'],
+      { stderr: (s) => (errMsg += s) }
+    );
+    assert.equal(failExit, 2);
+    assert.ok(errMsg.includes('致命的エラー🚀発生'), `Unexpected stderr message: ${errMsg}`);
+    assert.equal(errMsg.includes('\uFFFD'), false);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

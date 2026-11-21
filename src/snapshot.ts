@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { killProcessTree, tokenizeCommand } from './process-utils.js';
 import {
   canonicalize,
@@ -135,15 +136,84 @@ export async function captureMcpSnapshot(options: SnapshotOptions): Promise<McpS
       );
     });
 
+    const stderrDecoder = new StringDecoder('utf8');
+    const stdoutDecoder = new StringDecoder('utf8');
+    let stderrFlushed = false;
+    let stdoutFlushed = false;
+    let stdoutLimitExceeded = false;
+
+    const handleRawJsonRpcLine = (rawLine: string): void => {
+      if (rawLine.length === 0) return;
+
+      let parsed: JsonRpcResponse;
+      try {
+        parsed = JSON.parse(rawLine) as JsonRpcResponse;
+      } catch {
+        // Ignore non-JSON diagnostic lines if any; wait for JSON-RPC frames
+        return;
+      }
+
+      if (parsed && typeof parsed === 'object' && typeof parsed.id === 'number') {
+        const waiter = pendingWaiters.get(parsed.id);
+        if (waiter) {
+          pendingWaiters.delete(parsed.id);
+          if (hasOwn(parsed, 'error') && parsed.error !== undefined) {
+            waiter.reject(
+              new SchemaGuardError(
+                'SNAPSHOT_ERROR',
+                `MCP server returned JSON-RPC error for request #${parsed.id}: ${JSON.stringify(parsed.error)}`
+              )
+            );
+          } else {
+            waiter.resolve(parsed.result);
+          }
+        }
+      }
+    };
+
+    const drainLineBuffer = (flushRemainder: boolean): void => {
+      let newlineIdx = lineBuffer.indexOf('\n');
+      while (newlineIdx !== -1) {
+        const rawLine = lineBuffer.slice(0, newlineIdx).trim();
+        lineBuffer = lineBuffer.slice(newlineIdx + 1);
+        newlineIdx = lineBuffer.indexOf('\n');
+        handleRawJsonRpcLine(rawLine);
+      }
+      if (flushRemainder && lineBuffer.length > 0) {
+        const trailingLine = lineBuffer.trim();
+        lineBuffer = '';
+        handleRawJsonRpcLine(trailingLine);
+      }
+    };
+
+    const flushStderr = (): void => {
+      if (stderrFlushed) return;
+      stderrFlushed = true;
+      if (stderrText.length < 16 * 1024) {
+        stderrText += stderrDecoder.end();
+      }
+    };
+
+    const flushStdout = (): void => {
+      if (stdoutFlushed) return;
+      stdoutFlushed = true;
+      if (stdoutLimitExceeded) return;
+      lineBuffer += stdoutDecoder.end();
+      drainLineBuffer(true);
+    };
+
     proc.stderr?.on('data', (chunk: Buffer) => {
       if (stderrText.length < 16 * 1024) {
-        stderrText += chunk.toString('utf8');
+        stderrText += stderrDecoder.write(chunk);
       }
     });
+
+    proc.stderr?.once('end', flushStderr);
 
     proc.stdout?.on('data', (chunk: Buffer) => {
       totalStdoutBytes += chunk.byteLength;
       if (totalStdoutBytes > MAX_SPEC_BYTES) {
+        stdoutLimitExceeded = true;
         failAllPending(
           new SchemaGuardError(
             'FILE_TOO_LARGE',
@@ -154,43 +224,15 @@ export async function captureMcpSnapshot(options: SnapshotOptions): Promise<McpS
         return;
       }
 
-      lineBuffer += chunk.toString('utf8');
-      let newlineIdx = lineBuffer.indexOf('\n');
-      while (newlineIdx !== -1) {
-        const rawLine = lineBuffer.slice(0, newlineIdx).trim();
-        lineBuffer = lineBuffer.slice(newlineIdx + 1);
-        newlineIdx = lineBuffer.indexOf('\n');
-
-        if (rawLine.length === 0) continue;
-
-        let parsed: JsonRpcResponse;
-        try {
-          parsed = JSON.parse(rawLine) as JsonRpcResponse;
-        } catch {
-          // Ignore non-JSON diagnostic lines if any; wait for JSON-RPC frames
-          continue;
-        }
-
-        if (parsed && typeof parsed === 'object' && typeof parsed.id === 'number') {
-          const waiter = pendingWaiters.get(parsed.id);
-          if (waiter) {
-            pendingWaiters.delete(parsed.id);
-            if (hasOwn(parsed, 'error') && parsed.error !== undefined) {
-              waiter.reject(
-                new SchemaGuardError(
-                  'SNAPSHOT_ERROR',
-                  `MCP server returned JSON-RPC error for request #${parsed.id}: ${JSON.stringify(parsed.error)}`
-                )
-              );
-            } else {
-              waiter.resolve(parsed.result);
-            }
-          }
-        }
-      }
+      lineBuffer += stdoutDecoder.write(chunk);
+      drainLineBuffer(false);
     });
 
+    proc.stdout?.once('end', flushStdout);
+
     proc.once('close', (code) => {
+      flushStderr();
+      flushStdout();
       closedEarly = true;
       exitCode = code;
       if (!timedOut && pendingWaiters.size > 0) {
