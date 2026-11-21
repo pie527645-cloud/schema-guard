@@ -1,0 +1,52 @@
+{
+  "name": "@pie527645-cloud/schema-guard",
+  "version": "1.0.0",
+  "description": "Breaking change detector and contract snapshot diff CLI for OpenAPI 3.0/3.1, JSON Schema, and MCP tools/list.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "bin": {
+    "schema-guard": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "lint": "node scripts/lint.mjs",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.test.json",
+    "test": "node --test dist-test/tests/diff-mcp.test.js dist-test/tests/diff-openapi.test.js dist-test/tests/diff-json-schema.test.js dist-test/tests/security-limits.test.js dist-test/tests/formatters-sarif.test.js dist-test/tests/cli-snapshot.test.js dist-test/tests/cli-git-diff.test.js"
+  },
+  "dependencies": {
+    "yaml": "^2.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.17.19",
+    "typescript": "^5.7.3"
+  },
+  "keywords": [
+    "openapi",
+    "json-schema",
+    "mcp",
+    "model-context-protocol",
+    "breaking-changes",
+    "contract-testing",
+    "sarif",
+    "cli"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pie527645-cloud/schema-guard.git"
+  }
+}
